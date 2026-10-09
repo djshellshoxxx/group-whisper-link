@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>group-whisper-link</title>
+<meta name="description" content="Temporary end-to-end encrypted group chat for up to 6 people. No server, no accounts, nothing stored.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%92%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1>group-whisper-link</h1>
+  <p class="tag">Temporary, end-to-end encrypted group chat for up to 6 people. No server, no account, nothing stored.</p>
+</header>
+
+<main>
+  <noscript><p class="banner error">This app needs JavaScript.</p></noscript>
+  <p id="unsupported" class="banner error" hidden>
+    This browser can't run group-whisper-link. It needs WebRTC and the Web Crypto API, and the page must be served over HTTPS.
+  </p>
+
+  <!-- 1. START -->
+  <section id="screen-start" class="card">
+    <h2>Start or join a group chat</h2>
+    <p>The person who creates the group is the <strong>host</strong>. Everyone else swaps two short codes with the host (by email, text, or any messenger) and joins. Messages are end-to-end encrypted, so the host can't read them either.</p>
+
+    <div class="row">
+      <label for="my-name">Your display name</label>
+      <input id="my-name" type="text" maxlength="20" autocomplete="off" spellcheck="false" placeholder="e.g. Alex">
+    </div>
+
+    <div class="row">
+      <label for="expiry">Auto-end and wipe after (host's choice applies to everyone)</label>
+      <select id="expiry">
+        <option value="10">10 minutes</option>
+        <option value="30" selected>30 minutes</option>
+        <option value="60">1 hour</option>
+        <option value="120">2 hours</option>
+        <option value="0">No time limit</option>
+      </select>
+    </div>
+
+    <label class="check">
+      <input type="checkbox" id="use-stun" checked>
+      <span>Use public STUN servers (needed when people are on different networks). This tells Google and Cloudflare your IP address. Untick it for same-network chats only.</span>
+    </label>
+
+    <p id="start-status" class="status" role="status" aria-live="polite"></p>
+
+    <div class="buttons">
+      <button id="btn-host" class="primary" type="button">Create a group (I'm the host)</button>
+      <button id="btn-join" type="button">Join a group (I have an invite code)</button>
+    </div>
+  </section>
+
+  <!-- 2a. HOST LOBBY -->
+  <section id="screen-lobby" class="card" hidden>
+    <h2>Group lobby</h2>
+    <p>Click <strong>Add a person</strong> for each person you want to invite (up to 5). Send each person their own invite code, and paste the reply code they send back. When everyone has joined, click <strong>Start chat</strong>. <strong>No one can join after that.</strong></p>
+
+    <h3>In the group</h3>
+    <ul id="lobby-members" class="members"></ul>
+
+    <div id="slots"></div>
+
+    <div class="buttons">
+      <button id="btn-add-slot" type="button">Add a person</button>
+      <button id="btn-start" class="primary" type="button" disabled>Start chat</button>
+      <button class="cancel" type="button">Cancel</button>
+    </div>
+    <p id="lobby-status" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <template id="slot-template">
+    <div class="slot">
+      <h3 class="slot-title"></h3>
+      <div class="slot-body">
+        <p class="small">Send this invite code to the person:</p>
+        <textarea class="invite-out" readonly rows="4" spellcheck="false" aria-label="Invite code"></textarea>
+        <div class="buttons">
+          <button class="copy-invite" type="button">Copy invite code</button>
+        </div>
+        <p class="small">Paste the reply code they send back:</p>
+        <textarea class="reply-in" rows="4" spellcheck="false" autocomplete="off" aria-label="Reply code" placeholder="WL1...."></textarea>
+        <div class="buttons">
+          <button class="paste-reply" type="button">Paste</button>
+          <button class="connect primary" type="button" disabled>Connect</button>
+          <button class="remove" type="button">Remove</button>
+        </div>
+      </div>
+      <p class="slot-status status" role="status" aria-live="polite"></p>
+    </div>
+  </template>
+
+  <!-- 2b. JOIN -->
+  <section id="screen-join" class="card" hidden>
+    <h2>Join a group</h2>
+
+    <div id="join-step1">
+      <h3>Step 1: paste the invite code</h3>
+      <textarea id="invite-in" rows="5" spellcheck="false" autocomplete="off" aria-label="Invite code from the host" placeholder="WL1...."></textarea>
+      <div class="buttons">
+        <button id="paste-invite" type="button">Paste</button>
+        <button id="btn-reply" class="primary" type="button">Create my reply code</button>
+        <button class="cancel" type="button">Cancel</button>
+      </div>
+    </div>
+
+    <div id="reply-box" hidden>
+      <h3>Step 2: send your reply code to the host</h3>
+      <p>Keep this page open. You will connect automatically.</p>
+      <textarea id="reply-out" readonly rows="5" spellcheck="false" aria-label="Your reply code"></textarea>
+      <div class="buttons">
+        <button id="copy-reply" type="button">Copy reply code</button>
+      </div>
+    </div>
+
+    <div id="join-wait" hidden>
+      <h3>Connected to the host</h3>
+      <p>Waiting for the host to start the chat. People here so far:</p>
+      <ul id="join-members" class="members"></ul>
+    </div>
+    <p id="join-status" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <!-- 3. VERIFY -->
+  <section id="screen-verify" class="card" hidden>
+    <h2>Verify the group</h2>
+    <p>Check that nobody has tampered with the group. <strong>Everyone</strong> must see exactly the same code below. Compare it <strong>on a voice or video call, or in person</strong>, not through the channel you used for the invite codes.</p>
+    <div id="group-code" class="sas" aria-live="off"></div>
+    <h3>Members</h3>
+    <ul id="verify-members" class="members"></ul>
+    <div class="buttons">
+      <button id="btn-match" class="primary" type="button">The codes match</button>
+      <button id="btn-nomatch" class="danger" type="button">They don't match</button>
+    </div>
+    <p class="small">If anyone sees a different code, someone may have tampered with the group. Don't continue.</p>
+  </section>
+
+  <!-- 4. CHAT -->
+  <section id="screen-chat" class="chat" hidden>
+    <div class="chatbar">
+      <span id="peer-state" class="pill">Waiting for the others to confirm the code…</span>
+      <span id="countdown" class="countdown"></span>
+      <button id="btn-end" class="danger" type="button">Leave and wipe</button>
+    </div>
+    <div id="chat-members" class="chat-members"></div>
+    <div id="messages" class="messages" role="log" aria-live="polite" aria-label="Messages"></div>
+    <form id="composer" class="composer" autocomplete="off">
+      <textarea id="msg-input" rows="2" maxlength="2000" placeholder="Type a message. Enter sends, Shift+Enter adds a new line." aria-label="Message"></textarea>
+      <button class="primary" type="submit">Send</button>
+    </form>
+    <p id="chat-status" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <!-- 5. ENDED -->
+  <section id="screen-ended" class="card" hidden>
+    <h2>Chat ended</h2>
+    <p id="ended-reason"></p>
+    <p>Keys and messages have been erased from this page.</p>
+    <div class="buttons">
+      <button id="btn-restart" class="primary" type="button">Start over</button>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>Messages are encrypted on your device before they leave it and can only be read by the people in the group. Keys exist only in memory, and closing the tab destroys them. The host's browser forwards messages, and every member's IP address is visible to the host. <a href="https://github.com/djshellshoxxx/group-whisper-link#how-it-works">How it works</a></p>
+</footer>
+</body>
+</html>
