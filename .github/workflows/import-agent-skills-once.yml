@@ -1,0 +1,41 @@
+name: One-time agent skills import
+on:
+  push:
+    paths:
+      - '.github/workflows/import-agent-skills-once.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: true
+      - name: Copy pinned Superpowers skills without overwriting existing files
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          git clone --quiet --depth 1 --filter=blob:none --sparse https://github.com/obra/superpowers.git "$root/superpowers"
+          git -C "$root/superpowers" sparse-checkout set skills
+          git -C "$root/superpowers" fetch --quiet --depth 1 origin bb92a77741419a4ab5f06e711a283343f1ada0c3
+          git -C "$root/superpowers" checkout --quiet --detach FETCH_HEAD
+          mkdir -p skills/_third_party_licenses/obra-superpowers
+          cp -n "$root/superpowers/LICENSE" skills/_third_party_licenses/obra-superpowers/LICENSE
+          for dir in "$root"/superpowers/skills/*/; do
+            name="$(basename "$dir")"
+            if [[ -e "skills/$name" && ! -d "skills/$name" ]]; then
+              echo "SKIPPED file/directory conflict: skills/$name"
+              continue
+            fi
+            mkdir -p "skills/$name"
+            cp -a -n "$dir/." "skills/$name/"
+          done
+          git rm -q -f .github/workflows/import-agent-skills-once.yml
+          git add -A skills
+          if ! git diff --cached --quiet; then
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Vendor Superpowers agent skills and preserve existing skills'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
