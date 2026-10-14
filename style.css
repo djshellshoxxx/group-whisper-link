@@ -397,3 +397,7 @@ button:focus-visible { outline: 2px solid var(--magenta); outline-offset: -5px; 
   letter-spacing: 0.1em;
   color: var(--magenta);
 }
+
+.small.warn { color: var(--magenta); }
+.steps { margin: 8px 0 8px 1.2rem; padding: 0; }
+.steps li { margin: 6px 0; }

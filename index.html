@@ -28,7 +28,7 @@
   <!-- 1. START -->
   <section id="screen-start" class="card">
     <h2>Start or join a group chat</h2>
-    <p>The person who creates the group is the <strong>host</strong>. Everyone else swaps two short codes with the host (by email, text, or any messenger) and joins. Messages are end-to-end encrypted, so the host can't read them either.</p>
+    <p>The person who creates the group is the <strong>host</strong>. Everyone else swaps two short codes with the host (by email, text, or any messenger) and joins. Messages are end-to-end encrypted: outsiders can't read them, and no one can forge another member's messages. The host is a member of the group, so the host can read everything too.</p>
 
     <div class="row">
       <label for="my-name">Your display name</label>
@@ -81,7 +81,7 @@
     <div class="slot">
       <h3 class="slot-title"></h3>
       <div class="slot-body">
-        <p class="small">Send this invite code to the person:</p>
+        <p class="small">Send this invite code to this person only. It contains your network (IP) address:</p>
         <textarea class="invite-out" readonly rows="4" spellcheck="false" aria-label="Invite code"></textarea>
         <div class="buttons">
           <button class="copy-invite" type="button">Copy invite code</button>
@@ -104,6 +104,7 @@
 
     <div id="join-step1">
       <h3>Step 1: paste the invite code</h3>
+      <p class="small warn">Only use an invite from someone you trust. Your browser will contact the network addresses listed in it, and the reply code you create contains your own IP address.</p>
       <textarea id="invite-in" rows="5" spellcheck="false" autocomplete="off" aria-label="Invite code from the host" placeholder="WL1...."></textarea>
       <div class="buttons">
         <button id="paste-invite" type="button">Paste</button>
@@ -132,15 +133,22 @@
   <!-- 3. VERIFY -->
   <section id="screen-verify" class="card" hidden>
     <h2>Verify the group</h2>
-    <p>Check that nobody has tampered with the group. <strong>Everyone</strong> must see exactly the same code below. Compare it <strong>on a voice or video call, or in person</strong>, not through the channel you used for the invite codes.</p>
+    <p>Do this <strong>on a voice or video call, or in person</strong>, not through the channel you used for the invite codes.</p>
+    <ol class="steps">
+      <li><strong>Each person reads out their own code</strong> below, one at a time. Every code must be exactly the same, all the way to the end.</li>
+      <li><strong>Check the member list.</strong> It must show exactly the people on the call, no more and no fewer, each under the right name.</li>
+    </ol>
     <div id="group-code" class="sas" aria-live="off"></div>
     <h3>Members</h3>
+    <p id="verify-count" class="small"></p>
     <ul id="verify-members" class="members"></ul>
+    <p id="verify-note" class="small warn" hidden></p>
+    <p id="verify-expiry" class="small"></p>
     <div class="buttons">
-      <button id="btn-match" class="primary" type="button">The codes match</button>
-      <button id="btn-nomatch" class="danger" type="button">They don't match</button>
+      <button id="btn-match" class="primary" type="button">Codes and members match</button>
+      <button id="btn-nomatch" class="danger" type="button">Something is wrong</button>
     </div>
-    <p class="small">If anyone sees a different code, someone may have tampered with the group. Don't continue.</p>
+    <p class="small">If any code differs, someone is missing or extra, or a name is wrong, someone may have tampered with the group. Don't continue. Note that the host and every member can read all messages once you confirm.</p>
   </section>
 
   <!-- 4. CHAT -->
@@ -153,7 +161,7 @@
     <div id="chat-members" class="chat-members"></div>
     <div id="messages" class="messages" role="log" aria-live="polite" aria-label="Messages"></div>
     <form id="composer" class="composer" autocomplete="off">
-      <textarea id="msg-input" rows="2" maxlength="2000" placeholder="Type a message. Enter sends, Shift+Enter adds a new line." aria-label="Message"></textarea>
+      <textarea id="msg-input" rows="2" maxlength="2000" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Type a message. Enter sends, Shift+Enter adds a new line." aria-label="Message"></textarea>
       <button class="primary" type="submit">Send</button>
     </form>
     <p id="chat-status" class="status" role="status" aria-live="polite"></p>
@@ -171,7 +179,7 @@
 </main>
 
 <footer>
-  <p>Messages are encrypted on your device before they leave it and can only be read by the people in the group. Keys exist only in memory, and closing the tab destroys them. The host's browser forwards messages, and every member's IP address is visible to the host. <a href="https://github.com/djshellshoxxx/group-whisper-link#how-it-works">How it works</a></p>
+  <p>Messages are encrypted on your device before they leave it and can only be read by the people in the group (the host included). Keys exist only in memory, and closing the tab destroys them. The host is a member too and can read everything, and the host's browser relays the messages. Every member's IP address is visible to the host, and the codes you swap contain it. <a href="https://github.com/djshellshoxxx/group-whisper-link#how-it-works" target="_blank" rel="noopener noreferrer">How it works</a></p>
 </footer>
 </body>
 </html>
