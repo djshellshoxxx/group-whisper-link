@@ -1,5 +1,5 @@
 **group-whisper-link**
 
-- [Home](Home)
-- [Architecture and Design Rationale](Architecture-and-Design-Rationale)
-- [Codebase Map](Codebase-Map)
+- [Home](Home.md)
+- [Architecture and Design Rationale](Architecture-and-Design-Rationale.md)
+- [Codebase Map](Codebase-Map.md)
