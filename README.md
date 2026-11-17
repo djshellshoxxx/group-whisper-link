@@ -40,6 +40,10 @@ Temporary, end-to-end encrypted **group chat for up to 6 people**. It runs entir
 - **Endpoints:** nothing protects you from malware or screen capture on any member's device, or from a member saving or sharing what they see.
 - Everyone must be online at the same time. There is no offline delivery and no history.
 
+## Wiki
+
+Wiki source pages are in [docs/wiki/](docs/wiki/Home.md): architecture rationale and a codebase map.
+
 ## Deploy on GitHub Pages
 
 1. Repo **Settings → Pages**.
