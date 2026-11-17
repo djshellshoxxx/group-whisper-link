@@ -17,7 +17,14 @@
  *          sender's ECDSA key, so the host can't read, forge, alter, or replay messages.
  */
 (() => {
-  const PROTO = 'whisper-group/v1';
+  // Refuse to run inside another page (clickjacking) and cut any link back to an opener (tab-napping).
+  try { window.opener = null; } catch (e) { /* ignore */ }
+  if (window.top !== window.self) {
+    document.body.textContent = 'For your safety this page will not run inside another page. Open it directly in its own browser tab.';
+    return;
+  }
+
+  const PROTO = 'whisper-group/v2';
   const MAX_GUESTS = 5;
   const MAX_NAME = 20;
   const MAX_ROSTER_NAME = 24;
@@ -26,7 +33,17 @@
   const MAX_CODE_CHARS = 24000;
   const MAX_SDP_CHARS = 16000;
   const MAX_INBOX = 500;
-  const MAX_SKIP = 1000;
+  const MAX_SKIP = 50;            // largest gap accepted in one message
+  const MAX_SKIP_TOTAL = 300;     // total gaps accepted per sender
+  const MAX_DECOMPRESSED = 64 * 1024;
+  const MAX_CANDIDATES = 12;
+  const MAX_DOM_ITEMS = 500;
+  const WINDOW_MS = 5000;
+  const SLOT_MAX_FRAMES = 250;    // frames one guest may send the host per window
+  const HOST_MAX_FRAMES = 1000;   // frames the host may send a guest per window
+  const MAX_BAD = 20;             // invalid messages from one sender per window before muting them
+  const MUTE_MS = 60000;
+  const RESERVED_NAMES = ['you', 'host', 'system'];
   const CONNECT_HINT_MS = 90000;
   const ICE_WAIT_MS = 6000;
   const STUN_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
@@ -64,6 +81,11 @@
     drainQ: Promise.resolve(),
     skQ: Promise.resolve(),
     sendQ: Promise.resolve(),
+    pair: {},             // per member: { toThem, fromThem } one-shot wrapping keys
+    bad: {},              // per sender: invalid-message counters
+    muted: {},            // per sender: ignore until this time
+    hostWin: { start: 0, count: 0 },
+    expiry: 0,
   };
 
   /* ---------- helpers ---------- */
@@ -103,14 +125,29 @@
   }
   const setStatus = (id, msg, kind) => setStatusEl($(id), msg, kind);
 
-  const errText = (e) => (e && e.message) || String(e);
+  // Only our own fixed messages are ever shown. Browser errors can echo attacker-controlled text.
+  class UserError extends Error {}
+  const errText = (e) => (e instanceof UserError ? e.message : 'Something went wrong. Please try again, or reload the page.');
 
-  // Strip control and bidi-override characters so a name can't spoof or break the layout.
+  // Remove characters that can reorder or hide text (bidi overrides and isolates).
+  const stripBidi = (t) => t.replace(/[\u202A-\u202E\u2066-\u2069]/g, '');
+
+  // Names: NFKC-normalised letters, marks, digits, spaces and a little punctuation, in a single alphabet.
+  // Returns '' when the name is not acceptable. Invisible and look-alike tricks are rejected here.
   function cleanName(s) {
-    return String(s || '')
-      .replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/g, '')
-      .trim();
+    const t = String(s || '').normalize('NFKC').replace(/ +/g, ' ').trim();
+    if (!t || t.length > MAX_ROSTER_NAME) return '';
+    if (!/^[\p{L}\p{N}][\p{L}\p{M}\p{N} ._'()-]*$/u.test(t)) return '';
+    if (/\p{Default_Ignorable_Code_Point}/u.test(t)) return '';
+    const latin = /\p{Script=Latin}/u.test(t);
+    const cyr = /\p{Script=Cyrillic}/u.test(t);
+    const greek = /\p{Script=Greek}/u.test(t);
+    if ((latin && cyr) || (latin && greek) || (cyr && greek)) return ''; // mixed alphabets are how look-alikes are built
+    return t;
   }
+
+  // Comparison form used to catch duplicates and reserved names.
+  const foldName = (n) => n.normalize('NFKC').toLowerCase().replace(/[\s._'()-]+/g, '');
 
   function concat(...arrs) {
     const out = new Uint8Array(arrs.reduce((n, a) => n + a.length, 0));
@@ -127,66 +164,151 @@
 
   /* ---------- codes (SDP blobs) ---------- */
 
-  async function pipeBytes(bytes, transform) {
-    const stream = new Blob([bytes]).stream().pipeThrough(transform);
-    return new Uint8Array(await new Response(stream).arrayBuffer());
+  async function pipeBytes(bytes, transform, maxOut) {
+    const reader = new Blob([bytes]).stream().pipeThrough(transform).getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > maxOut) {
+        reader.cancel();
+        throw new UserError('That code is too large.');
+      }
+      chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
   }
 
   async function packBlob(obj) {
     const raw = enc.encode(JSON.stringify(obj));
     if (typeof CompressionStream === 'function') {
-      return 'WL1.' + b64u.enc(await pipeBytes(raw, new CompressionStream('deflate-raw')));
+      return 'WL1.' + b64u.enc(await pipeBytes(raw, new CompressionStream('deflate-raw'), MAX_DECOMPRESSED));
     }
     return 'WL0.' + b64u.enc(raw);
   }
 
   async function unpackBlob(text, expectedRole) {
     const t = String(text || '').replace(/\s+/g, '');
-    if (t.length > MAX_CODE_CHARS) throw new Error('That code is too long to be a group-whisper-link code.');
+    if (t.length > MAX_CODE_CHARS) throw new UserError('That code is too long to be a group-whisper-link code.');
     const m = /^WL([01])\.([A-Za-z0-9_-]+)$/.exec(t);
-    if (!m) throw new Error("That doesn't look like a group-whisper-link code. Copy the whole thing, starting with WL.");
+    if (!m) throw new UserError("That doesn't look like a group-whisper-link code. Copy the whole thing, starting with WL.");
     let bytes;
     let obj;
     try {
       bytes = b64u.dec(m[2]);
       if (m[1] === '1') {
-        if (typeof DecompressionStream !== 'function') throw new Error('unsupported');
-        bytes = await pipeBytes(bytes, new DecompressionStream('deflate-raw'));
+        if (typeof DecompressionStream !== 'function') throw new UserError('unsupported');
+        bytes = await pipeBytes(bytes, new DecompressionStream('deflate-raw'), MAX_DECOMPRESSED);
       }
       obj = JSON.parse(dec.decode(bytes));
     } catch (e) {
-      throw new Error('The code is damaged or incomplete. Copy it again in full.');
+      throw new UserError(e instanceof UserError ? e.message : 'The code is damaged or incomplete. Copy it again in full.');
     }
-    if (!obj || obj.v !== 1) throw new Error('Unsupported code version.');
+    if (!obj || obj.v !== 1) throw new UserError('Unsupported code version.');
     if (obj.r !== expectedRole) {
-      throw new Error(expectedRole === 'answer'
+      throw new UserError(expectedRole === 'answer'
         ? 'That is an invite code. Paste the reply code the other person sent you.'
         : 'That is a reply code. Paste the invite code instead.');
     }
-    if (typeof obj.s !== 'string' || obj.s.length > MAX_SDP_CHARS) throw new Error('Malformed code.');
+    if (typeof obj.s !== 'string' || obj.s.length > MAX_SDP_CHARS) throw new UserError('Malformed code.');
     return obj;
   }
 
   // The SDP must describe exactly one data channel and nothing else (no audio/video).
   function inspectSdp(sdp) {
-    if (!/^v=0\r?\n/.test(sdp)) throw new Error('Malformed connection data.');
+    if (!/^v=0\r?\n/.test(sdp)) throw new UserError('Malformed connection data.');
     const mLines = sdp.match(/^m=.*$/gm) || [];
     if (mLines.length !== 1 || !/^m=application /.test(mLines[0])) {
-      throw new Error('This code asks for more than a text chat (audio or video). Refusing it.');
+      throw new UserError('This code asks for more than a text chat (audio or video). Refusing it.');
     }
     const fps = new Set();
     for (const m of sdp.matchAll(/^a=fingerprint:(\S+) ([0-9A-Fa-f:]+)\s*$/gm)) {
-      if (m[1].toLowerCase() !== 'sha-256') throw new Error('Unsupported fingerprint type.');
+      if (m[1].toLowerCase() !== 'sha-256') throw new UserError('Unsupported fingerprint type.');
       fps.add(m[2].toUpperCase());
     }
-    if (fps.size !== 1) throw new Error('The code has no usable security fingerprint.');
+    if (fps.size !== 1) throw new UserError('The code has no usable security fingerprint.');
   }
 
   function parsePk(b64) {
     let bytes;
-    try { bytes = b64u.dec(b64); } catch (e) { throw new Error('Malformed key.'); }
-    if (bytes.length !== 65 || bytes[0] !== 4) throw new Error('Malformed key.');
+    try { bytes = b64u.dec(b64); } catch (e) { throw new UserError('Malformed key.'); }
+    if (bytes.length !== 65 || bytes[0] !== 4 || b64u.enc(bytes) !== b64) throw new UserError('Malformed key.');
     return bytes;
+  }
+
+  // True when s is canonical unpadded base64url of exactly `exact` bytes, or of min..max bytes.
+  function isB64u(s, exact, max, min) {
+    if (typeof s !== 'string' || !/^[A-Za-z0-9_-]+$/.test(s) || s.length > 20000) return false;
+    try {
+      const d = b64u.dec(s);
+      if (exact !== undefined ? d.length !== exact : (d.length > max || d.length < (min || 0))) return false;
+      return b64u.enc(d) === s;
+    } catch (e) { return false; }
+  }
+
+  // Which network addresses from someone else's code are we willing to let the browser contact?
+  function addressIsSafe(addr) {
+    if (/^[0-9a-f-]{36}\.local$/i.test(addr)) return true; // browser-generated mDNS name
+    const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(addr);
+    if (v4) {
+      const o = v4.slice(1).map(Number);
+      if (o.some((x) => x > 255)) return false;
+      if (o[0] === 0 || o[0] === 127 || o[0] >= 224) return false; // unspecified, loopback, multicast, reserved
+      if (o[0] === 169 && o[1] === 254) return false;             // link-local
+      return true;
+    }
+    if (/^[0-9a-f:]{2,45}$/i.test(addr) && addr.includes(':')) {
+      const a = addr.toLowerCase();
+      return !(a === '::' || a === '::1' || a.startsWith('fe80') || a.startsWith('ff'));
+    }
+    return false; // hostnames would trigger DNS lookups
+  }
+
+  function candidateIsSafe(line) {
+    const p = line.slice('a=candidate:'.length).trim().split(/\s+/);
+    if (p.length < 8 || p[6] !== 'typ') return false;
+    const port = Number(p[5]);
+    return p[2].toLowerCase() === 'udp'
+      && ['host', 'srflx', 'prflx'].includes(p[7])
+      && Number.isInteger(port) && port >= 1024 && port <= 65535
+      && addressIsSafe(p[4]);
+  }
+
+  // Rebuild the other side's SDP keeping only what we need. Their candidate list decides which addresses
+  // our browser will probe, so it is filtered and capped. Default address/port lines are neutralised.
+  function sanitizeRemoteSdp(sdp) {
+    const out = [];
+    let kept = 0;
+    for (const line of sdp.split(/\r?\n/)) {
+      if (line === '') continue;
+      if (line.startsWith('a=candidate:')) {
+        if (kept < MAX_CANDIDATES && candidateIsSafe(line)) { out.push(line); kept++; }
+        continue;
+      }
+      if (line.startsWith('c=')) { out.push('c=IN IP4 0.0.0.0'); continue; }
+      if (line.startsWith('m=application ')) {
+        if (!/^m=application \d+ UDP\/DTLS\/SCTP webrtc-datachannel$/.test(line)) throw new UserError('Unsupported connection type in this code.');
+        out.push('m=application 9 UDP/DTLS/SCTP webrtc-datachannel');
+        continue;
+      }
+      if (line.startsWith('a=remote-candidates') || line.startsWith('a=rtcp:')) continue;
+      out.push(line);
+    }
+    if (!kept) throw new UserError('This code has no usable network address. Ask for a fresh one.');
+    return out.join('\r\n') + '\r\n';
+  }
+
+  async function applyRemote(pc, type, sdp) {
+    try {
+      await pc.setRemoteDescription({ type, sdp });
+    } catch (e) {
+      throw new UserError("Your browser rejected the other side's connection data. Ask them to create a fresh code.");
+    }
   }
 
   /* ---------- crypto ---------- */
@@ -258,40 +380,58 @@
   }
 
   function unpad(buf) {
-    if (buf.length < 4) throw new Error('bad padding');
+    if (buf.length < 4) throw new UserError('bad padding');
     const len = new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getUint32(0);
-    if (len > buf.length - 4) throw new Error('bad padding');
+    if (len > buf.length - 4) throw new UserError('bad padding');
     return buf.subarray(4, 4 + len);
   }
 
-  // Pairwise AES key for wrapping a sender chain key from member `from` to member `to`.
-  async function pairKey(from, to) {
-    const peer = G.roster[from === G.myIndex ? to : from];
-    const shared = await crypto.subtle.deriveBits({ name: 'ECDH', public: peer.ecdhKey }, G.keys.ecdhPriv, 256);
-    const hk = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
-    return crypto.subtle.deriveKey(
-      { name: 'HKDF', hash: 'SHA-256', salt: G.groupHash, info: enc.encode(`${PROTO} wrap ${from}>${to}`) },
-      hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  // One-shot wrapping keys for every other member. They are derived once, the long-lived ECDH private key is
+  // dropped straight away, and each wrapping key is deleted as soon as it has been used. Once the chain keys
+  // have been exchanged nothing is left that could unwrap a recorded copy of them (forward secrecy).
+  async function derivePairKeys(roster, groupHash, me) {
+    const pair = {};
+    for (const m of roster) {
+      if (m.i === me) continue;
+      const shared = await crypto.subtle.deriveBits({ name: 'ECDH', public: m.ecdhKey }, G.keys.ecdhPriv, 256);
+      const hk = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
+      new Uint8Array(shared).fill(0);
+      const wrapKey = (from, to, usage) => crypto.subtle.deriveKey(
+        { name: 'HKDF', hash: 'SHA-256', salt: groupHash, info: enc.encode(`${PROTO} wrap ${from}>${to}`) },
+        hk, { name: 'AES-GCM', length: 256 }, false, [usage]);
+      pair[m.i] = { toThem: await wrapKey(me, m.i, 'encrypt'), fromThem: await wrapKey(m.i, me, 'decrypt') };
+    }
+    return pair;
+  }
+
+  function pairDone(j) {
+    const p = G.pair[j];
+    if (p && !p.toThem && !p.fromThem) delete G.pair[j];
   }
 
   async function wrapChainKeyFor(j, ck) {
-    const key = await pairKey(G.myIndex, j);
+    const p = G.pair[j];
+    if (!p || !p.toThem) throw new UserError('No key available for that member.');
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const ct = new Uint8Array(await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv, additionalData: enc.encode(`${G.myIndex}>${j}`) }, key, ck));
+      { name: 'AES-GCM', iv, additionalData: enc.encode(`${G.myIndex}>${j}`) }, p.toThem, ck));
+    p.toThem = null;
+    pairDone(j);
     return { t: 'relay', k: 'sk', f: G.myIndex, to: j, iv: b64u.enc(iv), ct: b64u.enc(ct) };
   }
 
   async function onSk(m) {
     const f = m.f;
-    if (f === G.myIndex || G.recvChains[f] || G.left.has(f)) return;
+    const p = G.pair[f];
+    if (f === G.myIndex || G.recvChains[f] || !p || !p.fromThem) return;
     const iv = b64u.dec(m.iv);
-    if (iv.length !== 12) throw new Error('bad iv');
-    const key = await pairKey(f, G.myIndex);
+    if (iv.length !== 12) throw new UserError('bad iv');
     const ck = new Uint8Array(await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv, additionalData: enc.encode(`${f}>${G.myIndex}`) }, key, b64u.dec(m.ct)));
-    if (ck.length !== 32) throw new Error('bad chain key');
-    G.recvChains[f] = { key: ck, n: 0 };
+      { name: 'AES-GCM', iv, additionalData: enc.encode(`${f}>${G.myIndex}`) }, p.fromThem, b64u.dec(m.ct)));
+    if (ck.length !== 32) throw new UserError('bad chain key');
+    G.recvChains[f] = { key: ck, n: 0, skipped: 0 };
+    p.fromThem = null;
+    pairDone(f);
     updateReadiness();
     drain();
   }
@@ -307,27 +447,40 @@
     return { t: 'relay', k: 'm', f: G.myIndex, to: 'all', n, ct: b64u.enc(ct), sig: b64u.enc(sig) };
   }
 
+  // Too many invalid messages "from" one member in a short time: stop spending CPU on them for a while.
+  function noteBad(f) {
+    const now = Date.now();
+    let b = G.bad[f];
+    if (!b || now - b.start > WINDOW_MS) b = G.bad[f] = { start: now, count: 0 };
+    if (++b.count > MAX_BAD) {
+      G.muted[f] = now + MUTE_MS;
+      addSystem(`Ignoring messages claiming to be from ${G.roster[f].name} for a minute: too many invalid ones.`);
+    }
+  }
+
   async function processMsg(m, chain) {
     const sender = G.roster[m.f];
+    if ((G.muted[m.f] || 0) > Date.now()) return;
     const aad = aadFor(m.f, m.n);
     const ct = b64u.dec(m.ct);
     const sig = b64u.dec(m.sig);
     const ok = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, sender.signKey, sig, concat(aad, ct));
     if (!ok) {
+      noteBad(m.f);
       addSystem(`A message claiming to be from ${sender.name} had an invalid signature and was ignored.`);
       return;
     }
     if (m.n < chain.n) return; // replay
-    if (m.n - chain.n > MAX_SKIP) {
-      addSystem(`Ignored a message from ${sender.name} that skipped too far ahead.`);
+    const gap = m.n - chain.n;
+    if (gap > MAX_SKIP || chain.skipped + gap > MAX_SKIP_TOTAL) {
+      addSystem(`Ignored a message from ${sender.name}: too many messages are missing before it.`);
       return;
     }
-    let lost = 0;
-    while (chain.n < m.n) {
+    for (let i = 0; i < gap; i++) {
       const skipped = await ratchet(chain);
       skipped.mk.fill(0);
-      lost++;
     }
+    chain.skipped += gap;
     const { mk } = await ratchet(chain);
     const key = await crypto.subtle.importKey('raw', mk, 'AES-GCM', false, ['decrypt']);
     mk.fill(0);
@@ -339,7 +492,7 @@
       addSystem(`Could not decrypt a message from ${sender.name}.`);
       return;
     }
-    if (lost) addSystem(`${lost} message${lost > 1 ? 's' : ''} from ${sender.name} never arrived (the host may have dropped them).`);
+    if (gap) addSystem(`${gap} message${gap > 1 ? 's' : ''} from ${sender.name} never arrived (dropped or delayed on the way).`);
     if (obj && typeof obj.text === 'string' && obj.text.length <= MAX_TEXT) addMessage('them', obj.text, sender.name);
   }
 
@@ -347,32 +500,32 @@
     G.drainQ = G.drainQ.then(runDrain).catch(() => {});
   }
 
+  // Messages are taken one at a time, so a message that fails can never take its neighbours down with it.
   async function runDrain() {
-    if (!G.verifiedMe || G.ended) return;
-    const batch = G.inbox;
-    G.inbox = [];
-    const keep = [];
-    for (const m of batch) {
-      if (G.ended) return;
-      const chain = G.recvChains[m.f];
-      if (!chain) keep.push(m);
-      else await processMsg(m, chain);
+    while (G.verifiedMe && !G.ended) {
+      const idx = G.inbox.findIndex((m) => G.recvChains[m.f]);
+      if (idx < 0) return;
+      const m = G.inbox.splice(idx, 1)[0];
+      try {
+        await processMsg(m, G.recvChains[m.f]);
+      } catch (e) {
+        addSystem(`A message from ${G.roster[m.f].name} could not be processed and was skipped.`);
+      }
     }
-    G.inbox = keep.concat(G.inbox);
   }
 
   /* ---------- relay routing ---------- */
 
+  // Strict shape check: ids and sizes must be exactly right and every blob canonical base64url.
   function validRelay(m) {
     if (!m || m.t !== 'relay') return false;
     if (!Number.isInteger(m.f) || m.f < 0 || m.f > MAX_GUESTS) return false;
     if (m.k === 'sk') {
-      return Number.isInteger(m.to) && m.to >= 0 && m.to <= MAX_GUESTS
-        && typeof m.iv === 'string' && m.iv.length <= 24 && typeof m.ct === 'string' && m.ct.length <= 200;
+      return Number.isInteger(m.to) && m.to >= 0 && m.to <= MAX_GUESTS && isB64u(m.iv, 12) && isB64u(m.ct, 48);
     }
     if (m.k === 'm') {
       return m.to === 'all' && Number.isSafeInteger(m.n) && m.n >= 0
-        && typeof m.ct === 'string' && m.ct.length <= 24000 && typeof m.sig === 'string' && m.sig.length <= 200;
+        && isB64u(m.sig, 64) && isB64u(m.ct, undefined, 13000, 272);
     }
     return false;
   }
@@ -398,7 +551,7 @@
     if (m.k === 'sk') {
       if (m.to !== G.myIndex) return;
       G.skQ = G.skQ.then(() => onSk(m)).catch(() => {
-        addSystem(`Could not read the key from ${G.roster[m.f].name}.`);
+        addSystem(`Could not read the key from ${G.roster[m.f].name}. Check that you both saw the same group code.`);
       });
     } else if (m.k === 'm') {
       G.inbox.push(m);
@@ -455,28 +608,26 @@
     return G.slots.filter((s) => s.joined && s.dc && s.dc.readyState === 'open');
   }
 
-  function renderNames(listEl, names, meName) {
+  // people: [{ name, me, host }]. "(you)" and "(host)" come from position, never from comparing names.
+  function renderPeople(listEl, people) {
     listEl.textContent = '';
-    for (const n of names) {
+    for (const p of people) {
       const li = document.createElement('li');
-      li.textContent = n === meName ? n + ' (you)' : n;
-      if (n === meName) li.className = 'me';
+      const tags = [p.me && 'you', p.host && 'host'].filter(Boolean);
+      li.textContent = p.name + (tags.length ? ' (' + tags.join(', ') + ')' : '');
+      if (p.me) li.className = 'me';
       listEl.append(li);
     }
   }
 
-  function lobbyNames() {
-    return [G.myName, ...joinedSlots().map((s) => s.name)];
-  }
-
   function renderLobby() {
-    renderNames($('lobby-members'), lobbyNames(), G.myName);
+    renderPeople($('lobby-members'), [{ name: G.myName, me: true, host: true }, ...joinedSlots().map((s) => ({ name: s.name }))]);
     $('btn-start').disabled = joinedSlots().length < 1;
     $('btn-add-slot').disabled = G.slots.length >= MAX_GUESTS;
   }
 
   function broadcastLobby() {
-    const names = lobbyNames();
+    const names = [G.myName, ...joinedSlots().map((s) => s.name)];
     for (const s of joinedSlots()) sendJson(s.dc, { t: 'lobby', names });
   }
 
@@ -486,7 +637,7 @@
 
   async function addSlot() {
     if (G.slots.length >= MAX_GUESTS || G.started) return;
-    const slot = { id: ++G.slotSeq, pc: null, dc: null, joined: false, name: '', ecdh: '', sign: '', index: -1, timer: null };
+    const slot = { id: ++G.slotSeq, pc: null, dc: null, joined: false, name: '', ecdh: '', sign: '', index: -1, timer: null, win: { start: 0, count: 0 } };
     const el = $('slot-template').content.firstElementChild.cloneNode(true);
     slot.el = el;
     el.querySelector('.slot-title').textContent = 'Person ' + slot.id;
@@ -501,6 +652,7 @@
     slotStatus(slot, 'Creating the invite code…');
     try {
       slot.pc = makePc(() => slotStatus(slot, FAIL_HINT, 'error'));
+      slot.pc.ondatachannel = (ev) => ev.channel.close(); // we never expect a guest to open channels
       slot.dc = slot.pc.createDataChannel('chat');
       wireSlotChannel(slot);
       await slot.pc.setLocalDescription(await slot.pc.createOffer());
@@ -509,7 +661,7 @@
       inspectSdp(sdp);
       el.querySelector('.invite-out').value = await packBlob({ v: 1, r: 'offer', s: sdp });
       el.querySelector('.connect').disabled = false;
-      slotStatus(slot, 'Invite ready. Send it to this person, then paste their reply.', 'ok');
+      slotStatus(slot, 'Invite ready. Send it to this person only, then paste their reply.', 'ok');
     } catch (e) {
       slotStatus(slot, 'Could not create the invite: ' + errText(e), 'error');
     }
@@ -536,7 +688,8 @@
       slotStatus(slot, 'Checking the reply…');
       const msg = await unpackBlob(slot.el.querySelector('.reply-in').value, 'answer');
       inspectSdp(msg.s);
-      await slot.pc.setRemoteDescription({ type: 'answer', sdp: msg.s });
+      const safeSdp = sanitizeRemoteSdp(msg.s);
+      await applyRemote(slot.pc, 'answer', safeSdp);
       slotStatus(slot, 'Connecting…');
       clearTimeout(slot.timer);
       slot.timer = setTimeout(() => {
@@ -554,34 +707,58 @@
     ch.onclose = () => onSlotClosed(slot);
     ch.onmessage = (ev) => {
       if (typeof ev.data !== 'string' || ev.data.length > MAX_FRAME_CHARS) return;
+      // The host relays everything a guest sends to every other member, so one guest must not be able to flood it.
+      const now = Date.now();
+      if (now - slot.win.start > WINDOW_MS) { slot.win.start = now; slot.win.count = 0; }
+      if (++slot.win.count > SLOT_MAX_FRAMES) {
+        if (!slot.flooded) {
+          slot.flooded = true;
+          slotStatus(slot, (slot.name || 'This person') + ' was disconnected for sending data too fast.', 'error');
+          if (G.started && slot.joined) addSystem((slot.name || 'A member') + ' was disconnected for sending data too fast.');
+          try { slot.dc.close(); } catch (e) { /* ignore */ }
+        }
+        return;
+      }
       let m;
       try { m = JSON.parse(ev.data); } catch (e) { return; }
       onSlotMessage(slot, m);
     };
   }
 
+  // Checks a joining member's name and both public keys, including that the keys are real curve points.
+  async function validateIdentity(name, ecdh, sign) {
+    const clean = cleanName(name);
+    if (!clean || clean !== name || clean.length > MAX_NAME || RESERVED_NAMES.includes(foldName(clean))) throw new UserError('bad name');
+    parsePk(ecdh);
+    parsePk(sign);
+    await crypto.subtle.importKey('raw', b64u.dec(ecdh), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+    await crypto.subtle.importKey('raw', b64u.dec(sign), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+    return clean;
+  }
+
   function onSlotMessage(slot, m) {
     if (!m || typeof m.t !== 'string') return;
     if (m.t === 'hello') {
-      if (G.started || slot.joined) return;
-      try {
-        const name = cleanName(m.name);
-        if (!name || name !== m.name || name.length > MAX_NAME) throw new Error('bad name');
-        parsePk(m.ecdh);
-        parsePk(m.sign);
+      if (G.started || slot.joined || slot.helloBusy) return;
+      slot.helloBusy = true;
+      validateIdentity(m.name, m.ecdh, m.sign).then((name) => {
+        const taken = G.keys.ecdhB === m.ecdh || G.keys.signB === m.sign
+          || G.slots.some((o) => o !== slot && o.joined && (o.ecdh === m.ecdh || o.sign === m.sign));
+        if (taken) throw new UserError('duplicate keys');
+        if (G.started || G.ended || slot.gone) return;
         slot.name = name;
         slot.ecdh = m.ecdh;
         slot.sign = m.sign;
-      } catch (e) {
-        slotStatus(slot, 'This person sent invalid details and was rejected.', 'error');
-        return;
-      }
-      slot.joined = true;
-      clearTimeout(slot.timer);
-      slot.el.classList.add('joined');
-      slotStatus(slot, slot.name + ' joined.', 'ok');
-      renderLobby();
-      broadcastLobby();
+        slot.joined = true;
+        clearTimeout(slot.timer);
+        slot.el.classList.add('joined');
+        slotStatus(slot, slot.name + ' joined.', 'ok');
+        renderLobby();
+        broadcastLobby();
+      }).catch(() => {
+        slotStatus(slot, 'This person sent invalid details and was rejected. Remove this slot and invite them again.', 'error');
+        try { slot.dc.close(); } catch (e) { /* ignore */ }
+      });
     } else if (m.t === 'relay') {
       if (!G.started || !slot.joined || !validRelay(m) || m.f !== slot.index) return;
       hubForward(m, slot);
@@ -605,6 +782,7 @@
     }
     if (!slot.joined) return;
     G.left.add(slot.index);
+    delete G.pair[slot.index];
     for (const s of G.slots) if (s !== slot) sendJson(s.dc, { t: 'left', i: slot.index });
     addSystem(slot.name + ' left the chat.');
     renderMembers();
@@ -620,23 +798,25 @@
     $('btn-start').disabled = true;
     $('btn-add-slot').disabled = true;
     try {
-      const used = new Set([G.myName.toLowerCase()]);
+      const used = new Set([foldName(G.myName)]);
       const members = [{ i: 0, name: G.myName, ecdh: G.keys.ecdhB, sign: G.keys.signB }];
       joined.forEach((s, k) => {
         let nm = s.name;
         let c = 2;
-        while (used.has(nm.toLowerCase())) nm = `${s.name.slice(0, 14)} (${c++})`;
-        used.add(nm.toLowerCase());
+        while (used.has(foldName(nm))) nm = `${s.name.slice(0, 14)} (${c++})`;
+        used.add(foldName(nm));
         s.index = k + 1;
         s.name = nm;
         members.push({ i: s.index, name: nm, ecdh: s.ecdh, sign: s.sign });
       });
+      // Everything that can fail is done before anyone is told the group has started.
+      await prepareGroup(members, 0);
       for (const s of G.slots) if (!joined.includes(s)) closeSlot(s);
       G.slots = joined;
       G.started = true;
       const expiry = Number($('expiry').value);
       for (const s of joined) sendJson(s.dc, { t: 'roster', roster: members, expiry });
-      await enterVerify(members, 0, expiry);
+      showVerify(expiry);
     } catch (e) {
       endSession('Could not start the chat: ' + errText(e), true);
     }
@@ -652,6 +832,7 @@
       setStatus('join-status', 'Checking the invite…');
       const msg = await unpackBlob($('invite-in').value, 'offer');
       inspectSdp(msg.s);
+      const safeSdp = sanitizeRemoteSdp(msg.s);
 
       if (G.link) {
         try { G.link.pc.close(); } catch (e) { /* ignore */ }
@@ -665,22 +846,26 @@
         else setStatus('join-status', FAIL_HINT, 'error');
       });
       link.pc.ondatachannel = (ev) => {
-        if (link.dc || ev.channel.label !== 'chat') {
-          ev.channel.close();
+        const ch = ev.channel;
+        const safe = ch.label === 'chat' && ch.ordered && ch.maxRetransmits === null
+          && ch.maxPacketLifeTime === null && !ch.negotiated;
+        if (link.dc || !safe) {
+          ch.close();
+          if (!link.dc && !safe) setStatus('join-status', 'The host tried to open an unsafe data channel, so it was refused.', 'error');
           return;
         }
-        link.dc = ev.channel;
+        link.dc = ch;
         wireGuestChannel(link.dc);
         if (link.dc.readyState === 'open') onGuestOpen();
       };
-      await link.pc.setRemoteDescription({ type: 'offer', sdp: msg.s });
+      await applyRemote(link.pc, 'offer', safeSdp);
       await link.pc.setLocalDescription(await link.pc.createAnswer());
       await waitForIce(link.pc);
       const sdp = link.pc.localDescription.sdp;
       inspectSdp(sdp);
       $('reply-out').value = await packBlob({ v: 1, r: 'answer', s: sdp });
       $('reply-box').hidden = false;
-      setStatus('join-status', 'Reply code ready. Send it to the host and keep this page open.', 'ok');
+      setStatus('join-status', 'Reply code ready. Send it to the host only and keep this page open.', 'ok');
       clearTimeout(G.connectTimer);
       G.connectTimer = setTimeout(() => {
         if (!G.opened && !G.ended) setStatus('join-status', "Still not connected. Check that the host pasted your reply code. If you are on different networks, make sure STUN is ticked on both sides.", 'error');
@@ -699,6 +884,12 @@
     };
     ch.onmessage = (ev) => {
       if (typeof ev.data !== 'string' || ev.data.length > MAX_FRAME_CHARS) return;
+      const now = Date.now();
+      if (now - G.hostWin.start > WINDOW_MS) { G.hostWin.start = now; G.hostWin.count = 0; }
+      if (++G.hostWin.count > HOST_MAX_FRAMES) {
+        if (G.roster) addSystem('The host is sending data far too fast. Some of it was ignored.');
+        return;
+      }
       let m;
       try { m = JSON.parse(ev.data); } catch (e) { return; }
       onHostMessage(m);
@@ -713,23 +904,27 @@
     $('join-step1').hidden = true;
     $('reply-box').hidden = true;
     $('join-wait').hidden = false;
-    renderNames($('join-members'), [], G.myName);
+    renderPeople($('join-members'), []);
     setStatus('join-status', '');
   }
 
   function parseRoster(r) {
-    if (!Array.isArray(r) || r.length < 2 || r.length > MAX_GUESTS + 1) throw new Error('bad roster size');
+    if (!Array.isArray(r) || r.length < 2 || r.length > MAX_GUESTS + 1) throw new UserError('The host sent a group list of the wrong size.');
     const ecdhs = new Set();
     const signs = new Set();
+    const names = new Set();
     r.forEach((m, k) => {
-      if (!m || m.i !== k || typeof m.name !== 'string' || typeof m.ecdh !== 'string' || typeof m.sign !== 'string') throw new Error('bad roster entry');
-      if (!m.name || m.name.length > MAX_ROSTER_NAME || cleanName(m.name) !== m.name) throw new Error('bad roster name');
+      if (!m || m.i !== k || typeof m.name !== 'string' || typeof m.ecdh !== 'string' || typeof m.sign !== 'string') throw new UserError('The host sent a malformed group list.');
+      const clean = cleanName(m.name);
+      if (!clean || clean !== m.name || RESERVED_NAMES.includes(foldName(clean))) throw new UserError('The host listed a member with an unacceptable name.');
+      if (names.has(foldName(clean))) throw new UserError('The host listed two members with the same name.');
+      names.add(foldName(clean));
       parsePk(m.ecdh);
       parsePk(m.sign);
       ecdhs.add(m.ecdh);
       signs.add(m.sign);
     });
-    if (ecdhs.size !== r.length || signs.size !== r.length) throw new Error('duplicate keys in roster');
+    if (ecdhs.size !== r.length || signs.size !== r.length) throw new UserError('The host listed duplicate keys.');
     return r.map((m) => ({ i: m.i, name: m.name, ecdh: m.ecdh, sign: m.sign }));
   }
 
@@ -737,8 +932,8 @@
     if (!m || typeof m.t !== 'string' || G.ended) return;
     if (m.t === 'lobby') {
       if (G.started || !Array.isArray(m.names)) return;
-      const names = m.names.slice(0, MAX_GUESTS + 1).map((n) => cleanName(n).slice(0, MAX_ROSTER_NAME)).filter(Boolean);
-      renderNames($('join-members'), names, G.myName);
+      const names = m.names.slice(0, MAX_GUESTS + 1).map((n) => cleanName(n)).filter(Boolean);
+      renderPeople($('join-members'), names.map((n, i) => ({ name: n, host: i === 0 })));
     } else if (m.t === 'roster') {
       if (G.started) return;
       G.started = true;
@@ -746,11 +941,13 @@
         const members = parseRoster(m.roster);
         const mine = members.filter((x) => x.ecdh === G.keys.ecdhB && x.sign === G.keys.signB);
         if (mine.length !== 1 || mine[0].i === 0) {
-          throw new Error("The host's group list doesn't contain your keys, so it may have been tampered with.");
+          throw new UserError("The host's group list doesn't contain your keys, so it may have been tampered with.");
         }
+        G.renamedFrom = mine[0].name === G.myName ? '' : G.myName;
         G.myName = mine[0].name;
         const expiry = Number.isInteger(m.expiry) && m.expiry >= 0 && m.expiry <= 1440 ? m.expiry : 30;
-        await enterVerify(members, mine[0].i, expiry);
+        await prepareGroup(members, mine[0].i);
+        showVerify(expiry);
       } catch (e) {
         endSession('The group could not be set up: ' + errText(e), true);
       }
@@ -759,7 +956,7 @@
     } else if (m.t === 'left') {
       if (!G.roster || !Number.isInteger(m.i) || m.i <= 0 || m.i >= G.roster.length || m.i === G.myIndex || G.left.has(m.i)) return;
       G.left.add(m.i);
-      addSystem(G.roster[m.i].name + ' left the chat.');
+      addSystem(G.roster[m.i].name + ' left the chat (reported by the host).');
       renderMembers();
       updateReadiness();
     } else if (m.t === 'bye') {
@@ -769,19 +966,34 @@
 
   /* ---------- verification and chat ---------- */
 
-  async function enterVerify(members, myIndex, expiry) {
-    G.myIndex = myIndex;
-    G.roster = await Promise.all(members.map(async (m) => ({
+  // Imports every member's keys (rejecting anything that is not a real curve point), derives the group code and
+  // the one-shot wrapping keys, then drops the ECDH private key. Nothing is published to G until all of it worked.
+  async function prepareGroup(members, myIndex) {
+    const roster = await Promise.all(members.map(async (m) => ({
       ...m,
       ecdhKey: await crypto.subtle.importKey('raw', b64u.dec(m.ecdh), { name: 'ECDH', namedCurve: 'P-256' }, false, []),
       signKey: await crypto.subtle.importKey('raw', b64u.dec(m.sign), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']),
     })));
     const canonical = [PROTO, String(members.length), ...members.map((m) => [m.i, m.name, m.ecdh, m.sign].join('|'))].join('\n');
-    G.groupHash = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(canonical)));
-    G.code = codeString(G.groupHash.subarray(0, 16), 25);
+    const groupHash = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(canonical)));
+    const pair = await derivePairKeys(roster, groupHash, myIndex);
+    G.keys.ecdhPriv = null;
+    G.myIndex = myIndex;
+    G.roster = roster;
+    G.groupHash = groupHash;
+    G.pair = pair;
+    G.code = codeString(groupHash.subarray(0, 19), 30);
+  }
+
+  function showVerify(expiry) {
     $('group-code').textContent = G.code;
     $('group-code').setAttribute('aria-label', 'Group code: ' + G.code.split('').join(' '));
-    renderNames($('verify-members'), members.map((m) => m.name), members[myIndex].name);
+    renderPeople($('verify-members'), G.roster.map((m) => ({ name: m.name, me: m.i === G.myIndex, host: m.i === 0 })));
+    $('verify-count').textContent = G.roster.length + ' people are in this group, counting you and the host.';
+    $('verify-expiry').textContent = expiry ? 'Set by the host: the chat ends and wipes itself after ' + expiry + ' minutes.' : 'Set by the host: no time limit.';
+    const note = $('verify-note');
+    note.textContent = G.renamedFrom ? 'Notice: you asked to be called "' + G.renamedFrom + '", but the host listed you as "' + G.myName + '".' : '';
+    note.hidden = !G.renamedFrom;
     G.opened = true;
     startTimer(expiry);
     show('verify');
@@ -791,19 +1003,19 @@
   async function confirmMatch() {
     $('btn-match').disabled = true;
     G.verifiedMe = true;
-    G.ownChain = { key: crypto.getRandomValues(new Uint8Array(32)), n: 0 };
+    G.ownChain = { key: crypto.getRandomValues(new Uint8Array(32)), n: 0, skipped: 0 };
     show('chat');
     renderMembers();
     updateReadiness();
-    addSystem('Group code confirmed on your side. Messages are end-to-end encrypted.');
+    addSystem('Group code confirmed on your side. Messages are end-to-end encrypted, and everyone in the group, including the host, can read them.');
     const ck = G.ownChain.key.slice();
-    try {
-      for (const m of G.roster) {
-        if (m.i === G.myIndex || G.left.has(m.i)) continue;
+    for (const m of G.roster) {
+      if (m.i === G.myIndex) continue;
+      try {
         sendRelay(await wrapChainKeyFor(m.i, ck));
+      } catch (e) {
+        setStatus('chat-status', 'Could not share your key with ' + m.name + '.', 'error');
       }
-    } catch (e) {
-      setStatus('chat-status', 'Could not share your key: ' + errText(e), 'error');
     }
     ck.fill(0);
     drain();
@@ -815,13 +1027,16 @@
     box.textContent = 'Members: ';
     G.roster.forEach((m, k) => {
       const span = document.createElement('span');
-      span.textContent = m.i === G.myIndex ? 'You (' + m.name + ')' : m.name;
+      const tags = [m.i === G.myIndex && 'you', m.i === 0 && 'host'].filter(Boolean);
+      span.textContent = m.name + (tags.length ? ' (' + tags.join(', ') + ')' : '');
       if (G.left.has(m.i)) span.className = 'left';
       box.append(span);
       if (k < G.roster.length - 1) box.append(', ');
     });
   }
 
+  // "Waiting for X" is cryptographic: it clears only when X's key has arrived. A member the host reports as
+  // having left is only the host's word, so that is stated and never styled as success.
   function updateReadiness() {
     if (!G.verifiedMe || !G.roster) return;
     const el = $('peer-state');
@@ -829,14 +1044,28 @@
     if (missing.length) {
       el.textContent = 'Waiting for ' + missing.join(', ') + ' to confirm the code…';
       delete el.dataset.kind;
-    } else {
+      return;
+    }
+    const gone = G.left.size;
+    if (!gone) {
       el.textContent = 'Everyone is ready';
       el.dataset.kind = 'ok';
+    } else if (G.isHost) {
+      el.textContent = 'Everyone still here is ready (' + gone + ' left)';
+      el.dataset.kind = 'ok';
+    } else {
+      el.textContent = 'Everyone else is ready (the host says ' + gone + ' left)';
+      delete el.dataset.kind;
     }
   }
 
   function fmtTime(d) {
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function trimMessages() {
+    const list = $('messages');
+    while (list.childElementCount > MAX_DOM_ITEMS) list.firstElementChild.remove();
   }
 
   function addMessage(who, text, name) {
@@ -851,19 +1080,26 @@
     }
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
-    bubble.textContent = text;
+    bubble.textContent = stripBidi(text);
     const time = document.createElement('time');
     time.textContent = fmtTime(new Date());
     wrap.append(bubble, time);
     list.append(wrap);
+    trimMessages();
     list.scrollTop = list.scrollHeight;
   }
 
+  const sysSeen = new Map();
   function addSystem(text) {
+    const now = Date.now();
+    if (now - (sysSeen.get(text) || 0) < 5000) return; // the same notice at most every 5 seconds
+    sysSeen.set(text, now);
+    if (sysSeen.size > 200) sysSeen.clear();
     const el = document.createElement('div');
     el.className = 'sys';
     el.textContent = text;
     $('messages').append(el);
+    trimMessages();
     $('messages').scrollTop = $('messages').scrollHeight;
   }
 
@@ -937,6 +1173,9 @@
     for (const k of Object.keys(G.recvChains)) G.recvChains[k].key.fill(0);
     G.ownChain = null;
     G.recvChains = {};
+    G.pair = {};
+    G.bad = {};
+    G.muted = {};
     G.keys = null;
     G.roster = null;
     G.groupHash = null;
@@ -944,6 +1183,7 @@
     G.early = [];
     G.slots = [];
     G.link = null;
+    G.renamedFrom = '';
     $('messages').textContent = '';
     $('slots').textContent = '';
     for (const id of ['msg-input', 'invite-in', 'reply-out']) $(id).value = '';
@@ -977,9 +1217,9 @@
   /* ---------- wiring ---------- */
 
   function requireName() {
-    const name = cleanName($('my-name').value).slice(0, MAX_NAME);
-    if (!name) {
-      setStatus('start-status', 'Enter a display name first.', 'error');
+    const name = cleanName($('my-name').value);
+    if (!name || name.length > MAX_NAME || RESERVED_NAMES.includes(foldName(name))) {
+      setStatus('start-status', 'Use 1 to 20 letters, numbers or spaces from a single alphabet. "You", "Host" and "System" are not allowed.', 'error');
       $('my-name').focus();
       return false;
     }
@@ -1014,7 +1254,7 @@
     }
     $('btn-match').addEventListener('click', confirmMatch);
     $('btn-nomatch').addEventListener('click', () => {
-      endSession("You reported that the group codes don't match. Someone may have tampered with the group, so the chat was cancelled.", true);
+      endSession("You reported that the group details don't match. Someone may have tampered with the group, so the chat was cancelled.", true);
     });
     $('btn-end').addEventListener('click', () => {
       endSession(G.isHost ? 'You ended the group chat for everyone.' : 'You left the chat.', true);
@@ -1034,7 +1274,7 @@
     $('reply-out').addEventListener('focus', (e) => e.target.select());
 
     window.addEventListener('beforeunload', (e) => {
-      if (G.opened && !G.ended) e.preventDefault();
+      if (G.keys && !G.ended) e.preventDefault();
     });
   }
 
