@@ -20,6 +20,7 @@ Temporary, end-to-end encrypted **group chat for up to 6 people**. It runs entir
 1. A **group code** and a **member list** appear. On a **voice or video call (or in person)**:
    - **Each person reads out their own code**, one at a time. Every code must be identical, to the last character.
    - **Check the member list.** It must contain exactly the people on the call, with the right names. A missing, extra or misnamed member means something is wrong.
+   - An older version displays a 25-character code. This version displays 30 characters. If versions differ, everyone should reload the app and start a new group with fresh invites before comparing codes again.
 2. If everything matches, click **Codes and members match** and chat. Click **Something is wrong** if not. **Leave and wipe**, the timer, or closing the tab destroys your keys and messages.
 
 ## How it works
@@ -56,6 +57,10 @@ Temporary, end-to-end encrypted **group chat for up to 6 people**. It runs entir
 - **Endpoints:** nothing protects you from malware, a malicious browser extension, or screen capture on any member's device, or from a member saving or sharing what they see. Wiping is best-effort: browsers and operating systems can leave traces in memory that a web page can't erase. "Copy" puts a code on the clipboard, where clipboard-history tools may keep it.
 - Everyone must be online at the same time. There is no offline delivery and no history.
 - This is a small, custom, un-audited protocol. Don't rely on it where a failure would be dangerous.
+
+## Wiki
+
+Wiki source pages are in [docs/wiki/](docs/wiki/Home.md): architecture rationale and a codebase map.
 
 ## Deploy on GitHub Pages
 
